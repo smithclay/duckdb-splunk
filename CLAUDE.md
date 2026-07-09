@@ -76,6 +76,13 @@ normal HEC data even though the E2E "returned a row".
 
 ### Other load-bearing details in `logs_table.cpp`
 
+- **`SeverityToNumber` follows the OTel log data model's Appendix B and is kept byte-identical to
+  `StatusToSeverityNumber` in `~/workspace/duckdb-datadog`.** Change one, change both. `notice` is
+  INFO2 (10), not INFO; and `critical` (18) < `alert` (19) < `emergency`/`fatal` (21) stay ordered so
+  `severity_number > 17` can distinguish them. `~/workspace/duckdb-gcloud-observability`
+  intentionally differs above ERROR (CRITICAL 21 / ALERT 22 / EMERGENCY 24) because Cloud Logging's
+  LogSeverity is a fixed enum that the OTel Collector maps that way; the *bands* still agree
+  (`>= 17` error-class, `>= 21` fatal-class) so threshold filters stay portable across a UNION ALL.
 - **Output schema is exactly 18 columns** matching `read_otlp_logs`; `GetLogsSchema` and the `COL_*`
   indices must stay in sync (`D_ASSERT` guards the count). Attribute columns are VARCHAR JSON
   strings (flat table, not OTLP pdata maps) — a deliberate representational divergence from the

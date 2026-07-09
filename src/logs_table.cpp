@@ -93,6 +93,18 @@ static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 //===--------------------------------------------------------------------===//
 
 //! Map a severity/level string to an OTLP SeverityNumber (1-24). 0 = unspecified/unknown.
+//!
+//! Follows the OpenTelemetry log data model's "Appendix B: SeverityNumber example mappings", which
+//! is the authority for the freeform level vocabularies (syslog, log4j, zap, ...) that reach a
+//! Splunk index. Note `notice` is INFO2 (10), *not* INFO — and the top of the scale stays ordered:
+//! critical (18) < alert (19) < emergency/fatal (21). Collapsing those onto a single value would
+//! make `severity_number > 17` unable to distinguish a critical from an emergency.
+//!
+//! Kept identical to `StatusToSeverityNumber` in the sibling `duckdb-datadog`, so `severity_number`
+//! compares meaningfully across a UNION ALL of both readers. `duckdb-gcloud-observability`
+//! deliberately differs above ERROR: Cloud Logging's LogSeverity is a fixed nine-value enum that the
+//! OpenTelemetry Collector maps CRITICAL -> 21, ALERT -> 22, EMERGENCY -> 24, and matching the
+//! collector matters more there than matching this table.
 static int32_t SeverityToNumber(const string &severity) {
 	auto s = StringUtil::Lower(severity);
 	if (s == "trace") {
@@ -101,8 +113,11 @@ static int32_t SeverityToNumber(const string &severity) {
 	if (s == "debug") {
 		return 5;
 	}
-	if (s == "info" || s == "notice" || s == "ok") {
+	if (s == "info" || s == "ok") {
 		return 9;
+	}
+	if (s == "notice") {
+		return 10;
 	}
 	if (s == "warn" || s == "warning") {
 		return 13;
@@ -110,7 +125,13 @@ static int32_t SeverityToNumber(const string &severity) {
 	if (s == "error" || s == "err") {
 		return 17;
 	}
-	if (s == "critical" || s == "crit" || s == "alert" || s == "emergency" || s == "fatal") {
+	if (s == "critical" || s == "crit") {
+		return 18;
+	}
+	if (s == "alert") {
+		return 19;
+	}
+	if (s == "emergency" || s == "fatal") {
 		return 21;
 	}
 	return 0;
