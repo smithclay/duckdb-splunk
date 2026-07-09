@@ -1,0 +1,35 @@
+# Local Splunk for duckdb-splunk development and end-to-end testing.
+#
+#   docker compose up -d          # start Splunk (first boot takes ~1-2 minutes)
+#   docker compose logs -f splunk # watch startup
+#   docker compose down           # stop and remove
+#
+# Endpoints once healthy:
+#   UI:              http://localhost:8000   (admin / changeme12345)
+#   Management/REST: https://localhost:8089  (self-signed cert -> INSECURE_TLS true)
+#   HEC ingest:      https://localhost:8088/services/collector/event  (token: tero-dev-token)
+services:
+  splunk:
+    image: splunk/splunk:latest
+    # Splunk only publishes linux/amd64 images; on Apple Silicon / arm64 this runs under emulation.
+    platform: linux/amd64
+    container_name: splunk
+    ports:
+      - "8000:8000" # web UI
+      - "8088:8088" # HTTP Event Collector (HEC)
+      - "8089:8089" # management / search REST API
+    environment:
+      SPLUNK_START_ARGS: "--accept-license"
+      SPLUNK_GENERAL_TERMS: "--accept-sgt-current-at-splunk-com"
+      # NOTE: intentionally no SPLUNK_LICENSE_URI=Free. The Free license disables the "Auth" feature,
+      # which makes the REST search API reject credentialed requests with HTTP 401. The default
+      # 60-day Enterprise trial keeps authentication enabled (needed for basic-auth search).
+      SPLUNK_PASSWORD: "changeme12345"
+      SPLUNK_HEC_TOKEN: "tero-dev-token"
+    healthcheck:
+      # Splunkd is ready once the management API answers.
+      test: ["CMD", "curl", "-skf", "https://localhost:8089/services/server/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s

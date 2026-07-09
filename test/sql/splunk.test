@@ -1,0 +1,123 @@
+# name: test/sql/splunk.test
+# description: test the splunk extension (offline: load, secret, registration, error paths)
+# group: [sql]
+
+# Before the extension is loaded the table function does not exist.
+statement error
+SELECT * FROM read_splunk_logs(query => '*', earliest => '-15m', latest => 'now');
+----
+does not exist
+
+require splunk
+
+# The reader is registered.
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_splunk_logs';
+----
+true
+
+# Calling it without any splunk secret gives a helpful error (this only binds; no network call).
+statement error
+SELECT * FROM read_splunk_logs(query => '*', earliest => '-15m', latest => 'now');
+----
+No 'splunk' secret found
+
+# The custom secret type works with basic auth.
+statement ok
+CREATE SECRET splunk_local (
+    TYPE splunk,
+    URL 'https://localhost:8089',
+    USERNAME 'admin',
+    PASSWORD 'SECRET_PASSWORD_VALUE',
+    INSECURE_TLS true
+);
+
+query I
+SELECT type FROM duckdb_secrets() WHERE name = 'splunk_local';
+----
+splunk
+
+# It also works with token auth.
+statement ok
+CREATE SECRET splunk_token (
+    TYPE splunk,
+    URL 'https://my-splunk.example.com:8089',
+    TOKEN 'SECRET_TOKEN_VALUE',
+    INSECURE_TLS false
+);
+
+# The token scheme can be selected with TOKEN_TYPE ('Bearer' the default, or 'Splunk').
+statement ok
+CREATE SECRET splunk_token_scheme (
+    TYPE splunk,
+    URL 'https://my-splunk.example.com:8089',
+    TOKEN 'SECRET_TOKEN_VALUE',
+    TOKEN_TYPE 'Splunk'
+);
+
+# PASSWORD is redacted, never shown in duckdb_secrets().
+query I
+SELECT secret_string NOT LIKE '%SECRET_PASSWORD_VALUE%' FROM duckdb_secrets() WHERE name = 'splunk_local';
+----
+true
+
+# TOKEN is redacted, never shown in duckdb_secrets().
+query I
+SELECT secret_string NOT LIKE '%SECRET_TOKEN_VALUE%' FROM duckdb_secrets() WHERE name = 'splunk_token';
+----
+true
+
+# A secret with neither token nor username+password is rejected at bind time.
+statement ok
+CREATE SECRET splunk_empty (TYPE splunk, URL 'https://localhost:8089');
+
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_empty');
+----
+must provide either TOKEN, or USERNAME and PASSWORD
+
+# An invalid TOKEN_TYPE is rejected at bind time.
+statement ok
+CREATE SECRET splunk_bad_scheme (TYPE splunk, URL 'https://localhost:8089', TOKEN 'x', TOKEN_TYPE 'Basic');
+
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_bad_scheme');
+----
+TOKEN_TYPE must be 'Bearer' or 'Splunk'
+
+# With a secret present, binding succeeds and exposes the OTLP-conformant schema (bind only, no
+# network call is made until the scan runs).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_splunk_logs(secret => 'splunk_local', query => '*'));
+----
+18
+
+# Key OTLP columns are present (order-independent).
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM read_splunk_logs(secret => 'splunk_local'))
+WHERE column_name IN ('time_unix_nano', 'observed_time_unix_nano', 'trace_id', 'span_id', 'severity_number',
+                      'severity_text', 'body', 'resource_attributes', 'log_attributes', 'flags');
+----
+10
+
+# Named parameters are validated at bind time (no network call is needed to hit these errors).
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_local', max_rows => -1);
+----
+max_rows must be >= 0
+
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_local', retries => -1);
+----
+retries must be >= 0
+
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_local', timeout => 0);
+----
+timeout must be >= 1
+
+# Unknown named parameters are rejected.
+statement error
+SELECT * FROM read_splunk_logs(secret => 'splunk_local', bogus_param => 10);
+----
+Invalid named parameter
