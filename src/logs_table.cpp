@@ -224,11 +224,8 @@ struct ResourceKeyMapping {
 	const char *otlp_key;   //! attribute name emitted in resource_attributes
 };
 static const ResourceKeyMapping kResourceKeys[] = {
-    {"host", "host.name"},
-    {"source", "com.splunk.source"},
-    {"sourcetype", "com.splunk.sourcetype"},
-    {"index", "com.splunk.index"},
-    {"splunk_server", "com.splunk.server"},
+    {"host", "host.name"},         {"source", "com.splunk.source"},        {"sourcetype", "com.splunk.sourcetype"},
+    {"index", "com.splunk.index"}, {"splunk_server", "com.splunk.server"},
 };
 
 static bool IsResourceKey(const char *key) {
