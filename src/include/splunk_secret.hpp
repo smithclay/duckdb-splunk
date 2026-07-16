@@ -10,6 +10,7 @@ class ExtensionLoader;
 //! Either `token` (Splunk authentication token) OR `username`+`password` (basic auth) must be set;
 //! token takes precedence when both are present.
 struct SplunkCredentials {
+	string name;
 	//! Management/search API base, e.g. "https://localhost:8089". No trailing path.
 	string url = "https://localhost:8089";
 	string username;

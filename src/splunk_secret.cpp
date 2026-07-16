@@ -88,6 +88,7 @@ SplunkCredentials GetSplunkCredentials(ClientContext &context, const string &sec
 	}
 
 	SplunkCredentials creds;
+	creds.name = base_secret.GetName();
 	Value value;
 	if (kv_secret->TryGetValue("url", value) && !value.IsNull() && !value.ToString().empty()) {
 		creds.url = value.ToString();

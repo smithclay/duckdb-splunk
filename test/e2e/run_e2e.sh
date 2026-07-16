@@ -4,11 +4,12 @@
 #
 # It proves the full round trip against a real (local, Dockerized) Splunk:
 #   build -> HEC ingest of a uniquely-marked event -> Splunk search REST API -> read_splunk_logs
-#   -> OTLP-shaped DuckDB rows.
+#   and the attached Splunk catalog -> OTLP-shaped DuckDB rows.
 #
 # The script starts (or reuses) a local Splunk Docker container, sends one uniquely-tagged event
-# via the HTTP Event Collector, then reads it back through read_splunk_logs() and asserts the
-# round-trip worked and the row is OTLP-shaped. Because Splunk indexing has latency, it polls.
+# via the HTTP Event Collector, then reads it back through read_splunk_logs() and sp.logs.main and
+# asserts the round-trip worked and both interfaces are OTLP-shaped. Because Splunk indexing has
+# latency, it polls.
 #
 # Configuration comes from the environment (all optional; defaults target local Splunk Docker):
 #   SPLUNK_URL           management/search API URL      (default: https://localhost:8089)
@@ -162,6 +163,9 @@ cat > "${SQL_FILE}" <<SQL
 ${SECRET_SQL}
 CREATE TEMP TABLE e2e_rows AS
     SELECT * FROM read_splunk_logs(query => '${SPLUNK_QUERY}', earliest => '-15m', latest => 'now');
+ATTACH 'splunk:' AS sp (TYPE splunk, SECRET 'splunk_e2e', INDEXES ['main']);
+CREATE TEMP TABLE e2e_catalog_rows AS
+    SELECT * FROM sp.logs.main WHERE body LIKE '%${MARKER}%';
 .output
 SELECT (SELECT count(*) FROM (DESCRIBE e2e_rows))::VARCHAR || '|' ||
   (SELECT (count(*) >= 1
@@ -171,7 +175,11 @@ SELECT (SELECT count(*) FROM (DESCRIBE e2e_rows))::VARCHAR || '|' ||
     AND bool_and(body LIKE '%${MARKER}%')
     AND bool_and(time_unix_nano IS NOT NULL)
     AND bool_and(log_attributes LIKE '%${MARKER}%')
-    AND bool_and(log_attributes LIKE '%abc123%')) FROM e2e_rows)::VARCHAR;
+    AND bool_and(log_attributes LIKE '%abc123%')) FROM e2e_rows)::VARCHAR || '|' ||
+  (SELECT (count(*) >= 1
+    AND bool_and(service_name = 'duckdb-splunk-e2e')
+    AND bool_and(severity_number = 17)
+    AND bool_and(body LIKE '%${MARKER}%')) FROM e2e_catalog_rows)::VARCHAR;
 .print ---SAMPLE---
 SELECT time_unix_nano, service_name, severity_text, severity_number, body FROM e2e_rows LIMIT 1;
 .print ---LOGATTRS---
@@ -181,12 +189,16 @@ assert_out="$("${DUCKDB_BIN}" -unsigned -noheader -list -init /dev/null < "${SQL
 
 summary_line="$(printf '%s\n' "${assert_out}" | head -n1 | tr -d '[:space:]')"
 column_count="${summary_line%%|*}"
-checks="${summary_line##*|}"
+remaining="${summary_line#*|}"
+checks="${remaining%%|*}"
+catalog_checks="${summary_line##*|}"
 
 [ "${column_count}" = "18" ] || fail "expected 18 OTLP columns, got '${column_count}'"
 ok "output schema has the 18 OTLP columns"
 [ "${checks}" = "true" ] || fail "row content assertions failed (got '${checks}')"
 ok "row content maps correctly (service_name, severity error->17, body, timestamp, log_attributes)"
+[ "${catalog_checks}" = "true" ] || fail "catalog row content assertions failed (got '${catalog_checks}')"
+ok "sp.logs.main returns the same indexed event through the catalog interface"
 
 log "Sample row:"
 printf '%s\n' "${assert_out}" | sed -n '/---SAMPLE---/,/---LOGATTRS---/p' | sed '1d;$d'

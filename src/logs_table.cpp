@@ -3,6 +3,7 @@
 #include "splunk_client.hpp"
 #include "splunk_secret.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -61,7 +62,7 @@ static constexpr idx_t COL_RESOURCE_ATTRS = 11;
 static constexpr idx_t COL_LOG_ATTRS = 15;
 static constexpr idx_t COLUMN_COUNT = 18;
 
-static void GetLogsSchema(vector<LogicalType> &types, vector<string> &names) {
+void GetSplunkLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	names = {"time_unix_nano",
 	         "observed_time_unix_nano",
 	         "trace_id",
@@ -499,6 +500,20 @@ static string BuildExportBody(const string &query, const string &earliest, const
 	return body;
 }
 
+//! Build a safe index restriction for a catalog table. Splunk string literals use backslash
+//! escaping for quotes and backslashes.
+static string BuildIndexQuery(const string &index_name) {
+	string escaped;
+	escaped.reserve(index_name.size());
+	for (auto ch : index_name) {
+		if (ch == '\\' || ch == '"') {
+			escaped.push_back('\\');
+		}
+		escaped.push_back(ch);
+	}
+	return "index=\"" + escaped + "\"";
+}
+
 //===--------------------------------------------------------------------===//
 // Response parsing (Splunk export returns newline-delimited JSON)
 //===--------------------------------------------------------------------===//
@@ -576,6 +591,7 @@ struct SplunkLogsBindData : public TableFunctionData {
 	string earliest = "-15m";
 	string latest = "now";
 	int64_t max_rows = 0; // 0 = unlimited
+	TableCatalogEntry *table = nullptr;
 	SplunkClient client;
 };
 
@@ -686,7 +702,7 @@ static unique_ptr<FunctionData> SplunkLogsBind(ClientContext &context, TableFunc
 	result->client.token_type = credentials.token_type;
 	result->client.insecure_tls = credentials.insecure_tls;
 
-	GetLogsSchema(return_types, names);
+	GetSplunkLogsSchema(return_types, names);
 	return std::move(result);
 }
 
@@ -733,6 +749,32 @@ void RegisterSplunkLogsFunction(ExtensionLoader &loader) {
 	// never pays the per-row log_attributes JSON serialization.
 	function.projection_pushdown = true;
 	loader.RegisterFunction(function);
+}
+
+static BindInfo SplunkLogsGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+	auto &data = bind_data->Cast<SplunkLogsBindData>();
+	D_ASSERT(data.table);
+	return BindInfo(*data.table);
+}
+
+TableFunction GetSplunkLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
+                                     const string &index_name, unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<SplunkLogsBindData>();
+	result->query = BuildIndexQuery(index_name);
+	result->table = &table;
+	auto credentials = GetSplunkCredentials(context, secret_name);
+	result->client.url = credentials.url;
+	result->client.username = credentials.username;
+	result->client.password = credentials.password;
+	result->client.token = credentials.token;
+	result->client.token_type = credentials.token_type;
+	result->client.insecure_tls = credentials.insecure_tls;
+	bind_data = std::move(result);
+
+	TableFunction function("splunk_logs_scan", {}, SplunkLogsScan, nullptr, SplunkLogsInitGlobal);
+	function.projection_pushdown = true;
+	function.get_bind_info = SplunkLogsGetBindInfo;
+	return function;
 }
 
 } // namespace duckdb

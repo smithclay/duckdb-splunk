@@ -54,6 +54,53 @@ SELECT * FROM read_splunk_logs(
 );
 ```
 
+## Splunk catalog
+
+Attach a Splunk instance as a read-only DuckDB catalog to query each index as a table in its
+`logs` schema:
+
+```sql
+LOAD splunk;
+
+CREATE SECRET splunk_prod (
+    TYPE splunk,
+    URL 'https://splunk.example.com:8089',
+    TOKEN '<token>'
+);
+
+ATTACH 'splunk:' AS sp (
+    TYPE splunk,
+    SECRET 'splunk_prod'
+);
+
+SELECT * FROM sp.logs.main LIMIT 10;
+
+-- Index names are preserved exactly; quote names that are not plain SQL identifiers.
+SELECT * FROM sp.logs."security-events" LIMIT 10;
+```
+
+Without `INDEXES`, `ATTACH` calls Splunk's `GET /services/data/indexes` endpoint once and caches the
+indexes visible to the selected credential for the lifetime of the attachment. If the endpoint is
+unavailable—for example, because the role cannot list indexes or the Splunk deployment does not
+expose it—supply the index names explicitly:
+
+```sql
+ATTACH 'splunk:' AS sp (
+    TYPE splunk,
+    SECRET 'splunk_prod',
+    INDEXES ['main', 'security-events']
+);
+```
+
+When `INDEXES` is present, attachment makes no network request. Duplicate names are ignored while
+input order and spelling are preserved. Omitting `SECRET` uses the same first in-scope `splunk`
+secret selection as `read_splunk_logs`.
+
+Every catalog table has the same 18-column schema as `read_splunk_logs` and searches exactly one
+index over the reader's default window, `earliest = '-15m'` through `latest = 'now'`. The catalog is
+read-only. Use `read_splunk_logs` when you need custom SPL, a different time window, a row cap,
+retry budget, or timeout.
+
 ## Credentials (`CREATE SECRET`)
 
 Two auth styles are supported. Either `TOKEN`, or `USERNAME` + `PASSWORD`, is required.
@@ -214,9 +261,9 @@ It:
 3. Ingests one uniquely-marked event through the HEC.
 4. Polls `read_splunk_logs` until the marker is searchable (default timeout 150s, configurable via
    `POLL_TIMEOUT`).
-5. Asserts: ≥1 row, 18 columns, `service_name = 'duckdb-splunk-e2e'`, `severity_text = 'error'`,
-   `severity_number = 17`, `body` contains the marker, `time_unix_nano IS NOT NULL`, and
-   `log_attributes` carries the custom marker/trace fields.
+5. Asserts the table function returns ≥1 correctly mapped 18-column OTLP row.
+6. Attaches the same secret with `INDEXES ['main']` and verifies `sp.logs.main` returns the same
+   indexed event through the catalog interface.
 
 Configuration is via environment variables (all optional; see the header of `run_e2e.sh`):
 `SPLUNK_URL`, `SPLUNK_USERNAME`, `SPLUNK_PASSWORD`, `SPLUNK_HEC_TOKEN`, `SPLUNK_INSECURE_TLS`,
