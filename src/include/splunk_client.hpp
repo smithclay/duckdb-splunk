@@ -50,6 +50,9 @@ struct SplunkClient {
 	//! InterruptException if the query was cancelled.
 	string ExportSearch(ClientContext &context, const string &form_body) const;
 
+	//! GET the indexes visible to the authenticated user as a JSON collection.
+	string ListIndexes(ClientContext &context) const;
+
 private:
 	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ExportSearch is
 	//! const — it runs against the const bind data shared by all scans — yet must cache the socket.
@@ -60,6 +63,10 @@ private:
 	//! Return the shared connection, creating and configuring it (auth, TLS, timeouts) on the first
 	//! call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+
+	//! Execute an authenticated GET or form POST with the shared retry policy.
+	string AuthenticatedRequest(ClientContext &context, const string &path, const string *form_body,
+	                            bool index_discovery) const;
 };
 
 } // namespace duckdb

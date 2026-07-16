@@ -32,8 +32,9 @@ endif()
 
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/splunk_extension.cpp src/splunk_secret.cpp
-                      src/splunk_client.cpp src/logs_table.cpp)
+set(EXTENSION_SOURCES
+    src/splunk_extension.cpp src/splunk_secret.cpp src/splunk_client.cpp
+    src/logs_table.cpp src/splunk_catalog.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

@@ -108,7 +108,8 @@ static uint64_t RateLimitRetryDelaySeconds(const duckdb_httplib_openssl::Respons
 	return MinValue<uint64_t>(uint64_t(1) << attempt, 60); // 1, 2, 4, 8, ... seconds
 }
 
-string SplunkClient::ExportSearch(ClientContext &context, const string &form_body) const {
+string SplunkClient::AuthenticatedRequest(ClientContext &context, const string &path, const string *form_body,
+                                          bool index_discovery) const {
 	duckdb_httplib_openssl::Headers headers = {
 	    {"Accept", "application/json"},
 	};
@@ -117,8 +118,8 @@ string SplunkClient::ExportSearch(ClientContext &context, const string &form_bod
 		if (context.interrupted) {
 			throw InterruptException();
 		}
-		auto response = GetConnection().Post("/services/search/v2/jobs/export", headers, form_body,
-		                                     "application/x-www-form-urlencoded");
+		auto response = form_body ? GetConnection().Post(path, headers, *form_body, "application/x-www-form-urlencoded")
+		                          : GetConnection().Get(path, headers);
 
 		if (!response) {
 			auto error = response.error();
@@ -144,12 +145,25 @@ string SplunkClient::ExportSearch(ClientContext &context, const string &form_bod
 			continue;
 		}
 		if (response->status < 200 || response->status >= 300) {
+			if (index_discovery && (response->status == 401 || response->status == 403)) {
+				throw IOException("Splunk index discovery returned HTTP %d. Automatic discovery requires permission "
+				                  "to list indexes; attach with INDEXES ['main', ...] to bypass discovery",
+				                  response->status);
+			}
 			// Body may contain a Splunk error message but never the credentials (those live only in
 			// the Authorization header, which is not echoed back).
 			throw IOException("Splunk API returned HTTP %d: %s", response->status, response->body);
 		}
 		return response->body;
 	}
+}
+
+string SplunkClient::ExportSearch(ClientContext &context, const string &form_body) const {
+	return AuthenticatedRequest(context, "/services/search/v2/jobs/export", &form_body, false);
+}
+
+string SplunkClient::ListIndexes(ClientContext &context) const {
+	return AuthenticatedRequest(context, "/services/data/indexes?output_mode=json&count=0", nullptr, true);
 }
 
 } // namespace duckdb
