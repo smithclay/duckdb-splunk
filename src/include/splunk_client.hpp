@@ -2,11 +2,17 @@
 
 #include "duckdb.hpp"
 
+#include <functional>
+
+#ifndef __EMSCRIPTEN__
+#include <mutex>
+
 //! Forward-declared so the (large) httplib header stays out of this public header. The namespace
 //! name matches cpp-httplib's OpenSSL build, which CMake selects globally via CPPHTTPLIB_OPENSSL_SUPPORT.
 namespace duckdb_httplib_openssl {
 class Client;
 }
+#endif
 
 namespace duckdb {
 class ClientContext;
@@ -42,27 +48,34 @@ struct SplunkClient {
 	SplunkClient();
 	~SplunkClient();
 
-	//! POST a form-encoded export search and return the raw (newline-delimited JSON) response body.
-	//! `form_body` is the already-URL-encoded application/x-www-form-urlencoded request body.
-	//! Transparently retries transient failures (429 / 5xx / transport errors) up to `retries`
-	//! times, sleeping in small slices so query interrupts (Ctrl+C) cancel the wait promptly.
-	//! Throws IOException when retries are exhausted or the failure is not transient, and
-	//! InterruptException if the query was cancelled.
-	string ExportSearch(ClientContext &context, const string &form_body) const;
+	//! Copy configuration (not a live connection) into `target`.
+	void CopyConfigTo(SplunkClient &target) const;
+
+	//! POST a form-encoded export search and pass response bytes to `on_chunk` as they arrive. Native
+	//! builds stream directly from the socket; browser builds use DuckDB-WASM's fetch-backed HTTPUtil
+	//! and deliver its completed body as one chunk. Returning false cancels the request.
+	void ExportSearch(ClientContext &context, const string &form_body,
+	                  const std::function<bool(const char *, idx_t)> &on_chunk) const;
+
+	//! Stop an in-flight native request. A no-op in browser builds.
+	void Cancel() const;
 
 	//! GET the indexes visible to the authenticated user as a JSON collection.
 	string ListIndexes(ClientContext &context) const;
 
 private:
+#ifndef __EMSCRIPTEN__
 	//! Lazily created on first use and reused (HTTP keep-alive). Mutable because ExportSearch is
 	//! const — it runs against the const bind data shared by all scans — yet must cache the socket.
 	//! Reset (and re-established) after a transport error, since the failure may have left the
 	//! pooled socket broken.
 	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
+	mutable std::mutex connection_mutex;
 
 	//! Return the shared connection, creating and configuring it (auth, TLS, timeouts) on the first
 	//! call.
 	duckdb_httplib_openssl::Client &GetConnection() const;
+#endif
 
 	//! Execute an authenticated GET or form POST with the shared retry policy.
 	string AuthenticatedRequest(ClientContext &context, const string &path, const string *form_body,

@@ -19,6 +19,14 @@
 #include <initializer_list>
 #include <memory>
 
+#ifndef __EMSCRIPTEN__
+#include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <thread>
+#endif
+
 using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
@@ -582,6 +590,25 @@ static void ThrowIfSearchError(yyjson_val *root) {
 	}
 }
 
+//! Parse one newline-delimited export record. Malformed lines are ignored, matching the previous
+//! defensive parser behavior, while valid Splunk ERROR/FATAL control records still fail the scan.
+template <class Fn>
+static void ParseExportLine(const char *line, idx_t length, Fn &&on_event) {
+	while (length > 0 && line[length - 1] == '\r') {
+		length--;
+	}
+	if (length == 0) {
+		return;
+	}
+	YyjsonDocPtr doc(yyjson_read(line, length, 0));
+	if (!doc) {
+		return;
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	ThrowIfSearchError(root);
+	ExtractEventsFromRoot(root, std::forward<Fn>(on_event));
+}
+
 //===--------------------------------------------------------------------===//
 // Table function state
 //===--------------------------------------------------------------------===//
@@ -599,61 +626,134 @@ struct SplunkLogsGlobalState : public GlobalTableFunctionState {
 	//! Source column for each output slot (projection pushdown); may contain virtual-column
 	//! sentinels (e.g. rowid for a bare count(*)), which MapEvent leaves NULL.
 	vector<column_t> column_ids;
-	//! Rows (projected columns only) parsed and waiting to be emitted. FetchAll caps this at
-	//! `max_rows`, so the scan can drain it without re-checking the limit.
+	//! Projected rows ready for the execution thread. Native builds cap this at two DuckDB vectors;
+	//! the producer blocks when it is full, bounding decoded-row memory independently of result size.
 	std::deque<vector<Value>> buffer;
+	SplunkClient client;
+
+#ifdef __EMSCRIPTEN__
+	//! Browser fetch currently exposes a completed response body. Keep a cursor into it and decode
+	//! only the rows requested by each scan call, avoiding a second all-rows materialization.
+	string response;
+	idx_t response_offset = 0;
+	idx_t produced = 0;
 	bool fetched = false;
+#else
+	std::mutex mutex;
+	std::condition_variable rows_available;
+	std::condition_variable space_available;
+	std::thread producer;
+	std::exception_ptr error;
+	bool started = false;
+	bool finished = false;
+	bool cancelled = false;
+
+	~SplunkLogsGlobalState() override {
+		{
+			std::lock_guard<std::mutex> guard(mutex);
+			cancelled = true;
+		}
+		space_available.notify_all();
+		client.Cancel();
+		if (producer.joinable()) {
+			producer.join();
+		}
+	}
+#endif
 
 	idx_t MaxThreads() const override {
-		return 1; // One buffered export request; scanning is sequential.
+		return 1;
 	}
 };
 
-//! Issue the export search once and parse its newline-delimited JSON body into `state.buffer`,
-//! honoring `max_rows`. Splunk's export endpoint returns the full [earliest, latest] window in one
-//! streamed response, so a single request suffices for the first version.
-static void FetchAll(ClientContext &context, const SplunkLogsBindData &bind, SplunkLogsGlobalState &state) {
-	string body = BuildExportBody(bind.query, bind.earliest, bind.latest, bind.max_rows);
-	string response = bind.client.ExportSearch(context, body);
-	state.fetched = true;
+#ifndef __EMSCRIPTEN__
+static constexpr idx_t SPLUNK_BUFFER_CAPACITY = STANDARD_VECTOR_SIZE * 2;
 
-	idx_t cap = bind.max_rows > 0 ? static_cast<idx_t>(bind.max_rows) : 0;
+//! Start the socket reader on first scan. It parses complete NDJSON lines from arbitrary network
+//! chunks and blocks after two vectors of decoded rows, providing backpressure all the way to the
+//! response socket. A single partial JSON line is the only unbounded parser allocation.
+static void StartExport(ClientContext &context, const SplunkLogsBindData &bind, SplunkLogsGlobalState &state) {
+	bind.client.CopyConfigTo(state.client);
+	auto body = BuildExportBody(bind.query, bind.earliest, bind.latest, bind.max_rows);
+	auto cap = bind.max_rows > 0 ? static_cast<idx_t>(bind.max_rows) : 0;
+	state.producer = std::thread([&context, &state, body, cap]() {
+		try {
+			string pending;
+			idx_t produced = 0;
+			bool limit_reached = false;
 
-	// The response is one JSON object per line. Parse each line independently so a single malformed
-	// line cannot abort the whole scan.
-	size_t start = 0;
-	const size_t len = response.size();
-	bool capped = false;
-	while (start < len && !capped) {
-		size_t end = response.find('\n', start);
-		if (end == string::npos) {
-			end = len;
-		}
-		// Trim trailing '\r' for CRLF-delimited streams.
-		size_t line_end = end;
-		if (line_end > start && response[line_end - 1] == '\r') {
-			line_end--;
-		}
-		if (line_end > start) {
-			YyjsonDocPtr doc(yyjson_read(response.c_str() + start, line_end - start, 0));
-			if (doc) {
-				yyjson_val *root = yyjson_doc_get_root(doc.get());
-				// Surface a server-side search error (bad SPL, etc.) instead of returning 0 rows.
-				ThrowIfSearchError(root);
-				ExtractEventsFromRoot(root, [&](yyjson_val *event) {
-					if (cap > 0 && state.buffer.size() >= cap) {
-						capped = true;
+			auto parse_line = [&](const char *line, idx_t length) {
+				ParseExportLine(line, length, [&](yyjson_val *event) {
+					if (limit_reached) {
+						return;
+					}
+					if (cap > 0 && produced >= cap) {
+						limit_reached = true;
 						return;
 					}
 					vector<Value> row;
 					MapEvent(event, state.column_ids, row);
+
+					std::unique_lock<std::mutex> lock(state.mutex);
+					state.space_available.wait(lock, [&]() {
+						return state.cancelled || context.interrupted || state.buffer.size() < SPLUNK_BUFFER_CAPACITY;
+					});
+					if (state.cancelled || context.interrupted) {
+						limit_reached = true;
+						return;
+					}
 					state.buffer.push_back(std::move(row));
+					produced++;
+					lock.unlock();
+					state.rows_available.notify_one();
 				});
+			};
+
+			state.client.ExportSearch(context, body, [&](const char *data, idx_t length) {
+				pending.append(data, length);
+				idx_t start = 0;
+				while (!limit_reached) {
+					auto newline = pending.find('\n', start);
+					if (newline == string::npos) {
+						break;
+					}
+					parse_line(pending.data() + start, newline - start);
+					start = newline + 1;
+				}
+				if (start > 0) {
+					pending.erase(0, start);
+				}
+				return !limit_reached;
+			});
+			if (!limit_reached && !pending.empty()) {
+				parse_line(pending.data(), pending.size());
+			}
+		} catch (...) {
+			std::lock_guard<std::mutex> guard(state.mutex);
+			if (!state.cancelled) {
+				state.error = std::current_exception();
 			}
 		}
-		start = end + 1;
-	}
+
+		{
+			std::lock_guard<std::mutex> guard(state.mutex);
+			state.finished = true;
+		}
+		state.rows_available.notify_all();
+	});
+	state.started = true;
 }
+#else
+static void FetchBrowserResponse(ClientContext &context, const SplunkLogsBindData &bind, SplunkLogsGlobalState &state) {
+	bind.client.CopyConfigTo(state.client);
+	auto body = BuildExportBody(bind.query, bind.earliest, bind.latest, bind.max_rows);
+	state.client.ExportSearch(context, body, [&](const char *data, idx_t length) {
+		state.response.append(data, length);
+		return true;
+	});
+	state.fetched = true;
+}
+#endif
 
 static unique_ptr<FunctionData> SplunkLogsBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
@@ -717,13 +817,15 @@ static void SplunkLogsScan(ClientContext &context, TableFunctionInput &data_p, D
 	auto &bind = data_p.bind_data->Cast<SplunkLogsBindData>();
 	auto &state = data_p.global_state->Cast<SplunkLogsGlobalState>();
 
-	// One buffered fetch on the first scan call; subsequent calls drain the buffer. FetchAll already
-	// capped the buffer at max_rows, so the drain loop just emits what is there.
+	idx_t count = 0;
+#ifdef __EMSCRIPTEN__
 	if (!state.fetched) {
-		FetchAll(context, bind, state);
+		FetchBrowserResponse(context, bind, state);
 	}
 
-	idx_t count = 0;
+	// First drain overflow from a buffered `results` array, then parse as many NDJSON records as fit
+	// in this output vector. The raw browser response is retained once, but decoded rows are not
+	// materialized wholesale.
 	while (count < STANDARD_VECTOR_SIZE && !state.buffer.empty()) {
 		auto &row = state.buffer.front();
 		for (idx_t col = 0; col < row.size(); col++) {
@@ -732,6 +834,66 @@ static void SplunkLogsScan(ClientContext &context, TableFunctionInput &data_p, D
 		state.buffer.pop_front();
 		count++;
 	}
+	while (count < STANDARD_VECTOR_SIZE && state.response_offset < state.response.size()) {
+		if (bind.max_rows > 0 && state.produced >= static_cast<idx_t>(bind.max_rows)) {
+			state.response_offset = state.response.size();
+			break;
+		}
+		auto newline = state.response.find('\n', state.response_offset);
+		if (newline == string::npos) {
+			newline = state.response.size();
+		}
+		ParseExportLine(state.response.data() + state.response_offset, newline - state.response_offset,
+		                [&](yyjson_val *event) {
+			                if (bind.max_rows > 0 && state.produced >= static_cast<idx_t>(bind.max_rows)) {
+				                return;
+			                }
+			                vector<Value> row;
+			                MapEvent(event, state.column_ids, row);
+			                state.produced++;
+			                if (count < STANDARD_VECTOR_SIZE) {
+				                for (idx_t col = 0; col < row.size(); col++) {
+					                output.SetValue(col, count, row[col]);
+				                }
+				                count++;
+			                } else {
+				                state.buffer.push_back(std::move(row));
+			                }
+		                });
+		state.response_offset = newline + 1;
+	}
+#else
+	if (!state.started) {
+		StartExport(context, bind, state);
+	}
+
+	std::unique_lock<std::mutex> lock(state.mutex);
+	while (state.buffer.empty() && !state.finished && !state.error) {
+		if (context.interrupted) {
+			state.cancelled = true;
+			lock.unlock();
+			state.space_available.notify_all();
+			state.client.Cancel();
+			throw InterruptException();
+		}
+		state.rows_available.wait_for(lock, std::chrono::milliseconds(100));
+	}
+	if (state.error) {
+		auto error = state.error;
+		lock.unlock();
+		std::rethrow_exception(error);
+	}
+	while (count < STANDARD_VECTOR_SIZE && !state.buffer.empty()) {
+		auto &row = state.buffer.front();
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		state.buffer.pop_front();
+		count++;
+	}
+	lock.unlock();
+	state.space_available.notify_one();
+#endif
 
 	output.SetCardinality(count);
 }
