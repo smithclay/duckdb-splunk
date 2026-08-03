@@ -3,15 +3,12 @@ cmake_minimum_required(VERSION 3.5)
 # Set extension name here
 set(TARGET_NAME splunk)
 
-# The only external dependency is OpenSSL (declared in ./vcpkg.json), used as
-# the TLS backend for HTTPS. For HTTP and JSON we deliberately reuse DuckDB's
-# own bundled, header-accessible libraries so this extension pulls in nothing
-# extra. HTTP uses duckdb/third_party/httplib (cpp-httplib, header-only);
-# compiling it with CPPHTTPLIB_OPENSSL_SUPPORT selects the
-# duckdb_httplib_openssl namespace, so it does not clash with core DuckDB's
-# non-SSL duckdb_httplib symbols. JSON uses duckdb/third_party/yyjson, already
-# compiled into libduckdb as duckdb_yyjson.
-find_package(OpenSSL REQUIRED)
+# Native HTTP uses DuckDB's bundled cpp-httplib with OpenSSL. Browser builds use
+# DuckDB-WASM's HTTPUtil/fetch transport and therefore need neither native
+# sockets nor OpenSSL. JSON always uses DuckDB's bundled yyjson.
+if(NOT EMSCRIPTEN)
+  find_package(OpenSSL REQUIRED)
+endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -40,13 +37,15 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 foreach(target ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
-  # Bundled httplib (header-only) + yyjson headers.
   target_include_directories(
-    ${target} PRIVATE "${SPLUNK_DUCKDB_DIR}/third_party/httplib"
-                      "${SPLUNK_DUCKDB_DIR}/third_party/yyjson/include")
-  # Select cpp-httplib's OpenSSL-enabled (and separately-namespaced) build.
-  target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
-  target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
+    ${target} PRIVATE "${SPLUNK_DUCKDB_DIR}/third_party/yyjson/include")
+  if(NOT EMSCRIPTEN)
+    target_include_directories(
+      ${target} PRIVATE "${SPLUNK_DUCKDB_DIR}/third_party/httplib")
+    # Select cpp-httplib's OpenSSL-enabled, separately-namespaced build.
+    target_compile_definitions(${target} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+    target_link_libraries(${target} OpenSSL::SSL OpenSSL::Crypto)
+  endif()
 endforeach()
 
 install(

@@ -216,10 +216,37 @@ The parser is defensive about Splunk's export JSON shapes: it handles per-line
 `{"result": {...}}` objects, a buffered `{"results": [...]}` array, and flat event objects, and
 tolerates missing optional fields.
 
+## DuckDB-WASM (browser)
+
+The extension builds for WASM with `make wasm_mvp`, `make wasm_eh`, or `make wasm_threads`, using
+`extension_config_wasm.cmake`. Browser builds use DuckDB-WASM's fetch-backed HTTP transport and do
+not link OpenSSL or native sockets. Both token and username/password authentication are supported.
+
+Splunk deployments commonly do not allow cross-origin browser requests. In that case, point `URL`
+at a same-origin or CORS-enabled proxy route; the extension preserves its path prefix before adding
+`/services/...`:
+
+```sql
+CREATE SECRET splunk_browser (
+    TYPE splunk,
+    URL 'https://your-app.example.com/api/splunk',
+    TOKEN '<token>',
+    TOKEN_TYPE 'Bearer'
+);
+```
+
+The proxy must forward the path and query string to the Splunk management API, permit the
+`Authorization` and `Content-Type` request headers, and answer `OPTIONS` preflight for `GET` and
+`POST`. Browser fetch owns TLS verification, cancellation, and retry behavior, so `INSECURE_TLS`
+has no effect in a WASM build. The browser transport currently exposes the completed response body;
+rows are decoded incrementally from that body rather than being materialized into a second full
+in-memory row set. Native builds stream from the response socket with a bounded two-vector buffer.
+
 ## Building
 
-Dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson) reuse the
-copies DuckDB already bundles, so nothing extra is pulled in.
+Native dependencies are minimal: only OpenSSL (via vcpkg). HTTP (cpp-httplib) and JSON (yyjson)
+reuse the copies DuckDB already bundles. WASM builds use DuckDB's browser HTTP transport and do not
+install OpenSSL.
 
 ```shell
 git submodule update --init --recursive   # duckdb + extension-ci-tools
